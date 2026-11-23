@@ -10,12 +10,7 @@ END_HEADER = struct.Struct("!IdI")
 
 
 def parse_profile(text, default_pps):
-    """Parse "t:pps,t:pps,..." into a sorted [(seconds, pps), ...] step list.
 
-    Example: "0:150,10:450,30:150" sends 150 pkt/s, jumps to 450 pkt/s after
-    10 s (controlled congestion burst) and drops back to 150 pkt/s after 30 s.
-    If the first step does not start at 0, --pps is used until it does.
-    """
     steps = []
     for item in text.split(","):
         t, pps = item.split(":")
@@ -96,6 +91,7 @@ def main():
 
             packet = HEADER.pack(sent, time.time()) + padding
             sock.sendto(packet, destination)
+            #print(f"Sent packet #{sent} to {destination[0]}:{destination[1]}")
             sent += 1
             next_send += 1.0 / pps_at(profile, now - start)
 

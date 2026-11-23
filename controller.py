@@ -1,36 +1,3 @@
-"""Ryu controller for the diamond topology: static baseline + adaptive rerouting.
-
-Same file, two behaviours, chosen with the ROUTING_MODE environment variable:
-
-  ROUTING_MODE=static    fixed client->path assignment (baseline). The
-                         controller still *monitors* and logs congestion so
-                         the baseline can be plotted, but never reroutes.
-  ROUTING_MODE=adaptive  (default) closed loop:
-                           1. poll flow + port statistics from s1
-                           2. turn byte counters into per-client rates (Mbps)
-                           3. compare per-path load with the path capacity
-                           4. if a path stays above the congestion threshold
-                              for CONFIRM_SAMPLES polls, move one client to
-                              the other path (rules re-pushed on s1 and s4)
-                           5. hold off for COOLDOWN seconds (no flapping)
-
-Start it with:
-    ROUTING_MODE=adaptive ryu-manager --ofp-tcp-listen-port 6653 controller.py
-
-Tunables (environment variables, all optional):
-    POLL_INTERVAL        seconds between stats polls            (0.5)
-    CONGESTION_THRESHOLD path load / capacity that counts as    (0.85)
-                         "overloaded"
-    CONFIRM_SAMPLES      consecutive polls before acting         (2)
-    REROUTE_COOLDOWN     seconds to wait after a reroute         (5.0)
-    RESULTS_DIR          where the logs below are written        (results)
-
-Logs written to RESULTS_DIR:
-    controller_stats.csv     one row per poll: offered load, utilisation,
-                             carried load and per-client rate / path
-    controller_events.jsonl  congestion_start / congestion_detected /
-                             reroute / congestion_cleared / no_reroute_possible
-"""
 import csv
 import json
 import os
@@ -56,28 +23,24 @@ HOSTS = {
 CLIENTS = (1, 2, 3)   # on s1
 SERVERS = (4, 5, 6)   # on s4
 
-# Uplink ports. Path A = s1 <-> s2 <-> s4, Path B = s1 <-> s3 <-> s4.
-# Same numbering on s1 and s4 (see topo.py).
-UPLINK = {"A": 4, "B": 5}
 
-# Link capacity of each path in Mbps. Must match the bw= values in topo.py.
-PATH_CAPACITY_MBPS = {"A": 5.0, "B": 10.0}
+UPLINK = {"A": 4, "B": 5} #ports and pathname
 
-# Which path each client starts on (static baseline). The adaptive mode
-# changes self.client_path at run time and re-pushes the s1 / s4 rules.
-CLIENT_PATH = {1: "A", 2: "B", 3: "A"}
+
+PATH_CAPACITY_MBPS = {"A": 5.0, "B": 10.0} #link capapcity
+
+
+CLIENT_PATH = {1: "A", 2: "B", 3: "A"} 
 
 PRIORITY = 200
 
-# s1 sees every client->server packet first, so its counters give the
-# per-client offered load and the uplink port counters give per-path load.
-MONITORED_DPID = 1
 
-# Flows slower than this are never worth moving (Mbps).
-MIN_FLOW_MBPS = 0.05
+MONITORED_DPID = 1 #datapath of s1
+
+MIN_FLOW_MBPS = 0.05 #min-flow threshold
 
 SERVER_MACS = {HOSTS[s]["mac"] for s in SERVERS}
-CLIENT_BY_PORT = {HOSTS[c]["port"]: c for c in CLIENTS}     # s1 port -> client
+CLIENT_BY_PORT = {HOSTS[c]["port"]: c for c in CLIENTS}    
 UPLINK_PORT_TO_PATH = {port: path for path, port in UPLINK.items()}
 
 
@@ -88,22 +51,15 @@ def _env_float(name, default):
         return float(default)
 
 
-# --------------------------------------------------------------------------
-# Pure helpers (no Ryu objects) so they can be unit-tested offline.
-# --------------------------------------------------------------------------
-def build_rules(dpid, client_path=CLIENT_PATH):
-    """Return [(match_kwargs, out_port), ...] for one switch.
 
-    Pure function (no Ryu objects) so the rules can be tested offline.
-    """
+def build_rules(dpid, client_path=CLIENT_PATH):
+
     rules = []
     mac = lambda h: HOSTS[h]["mac"]
 
-    if dpid == 1:
-        # deliver to local clients (any in_port)
+    if dpid == 1: #reroute to B
         for c in CLIENTS:
             rules.append(({"eth_dst": mac(c)}, HOSTS[c]["port"]))
-        # client -> server goes up the client's assigned path
         for c in CLIENTS:
             for s in SERVERS:
                 rules.append((
@@ -111,11 +67,9 @@ def build_rules(dpid, client_path=CLIENT_PATH):
                     UPLINK[client_path[c]],
                 ))
 
-    elif dpid == 4:
-        # deliver to local servers (any in_port)
+    elif dpid == 4:#rerout to B
         for s in SERVERS:
             rules.append(({"eth_dst": mac(s)}, HOSTS[s]["port"]))
-        # server -> client goes back on the same path the client uses
         for s in SERVERS:
             for c in CLIENTS:
                 rules.append((
@@ -124,8 +78,7 @@ def build_rules(dpid, client_path=CLIENT_PATH):
                 ))
 
     elif dpid in (2, 3):
-        # Middle switches: port 1 faces s1, port 2 faces s4.
-        # Path-agnostic, so rerouting only needs changes on s1 / s4.
+        # no routechnage, thus no rule chnage 
         for s in SERVERS:
             rules.append(({"in_port": 1, "eth_dst": mac(s)}, 2))
         for c in CLIENTS:
@@ -135,12 +88,10 @@ def build_rules(dpid, client_path=CLIENT_PATH):
 
 
 def rules_as_dict(rules):
-    """{hashable match: out_port} so two rule sets can be diffed."""
     return {tuple(sorted(match.items())): out for match, out in rules}
 
 
-def path_loads(rates, client_path):
-    """Sum per-client rates (Mbps) onto the path each client uses."""
+def path_loads(rates, client_path): #throghput via link calculation
     loads = {p: 0.0 for p in UPLINK}
     for client, path in client_path.items():
         loads[path] += rates.get(client, 0.0)
@@ -149,15 +100,6 @@ def path_loads(rates, client_path):
 
 def choose_reroute(rates, client_path, capacity=PATH_CAPACITY_MBPS,
                    threshold=0.85, min_rate=MIN_FLOW_MBPS):
-    """Pick one client to move off the most overloaded path.
-
-    Returns {"client", "from", "to", "rate", "projected_util"} or None.
-
-    For every client on the overloaded path we simulate moving it to the other
-    path and keep only moves that do not push the destination above the
-    threshold. Among those we take the one that leaves the lowest worst-case
-    utilisation (ties: move the smaller flow, it disturbs less).
-    """
     loads = path_loads(rates, client_path)
     util = {p: loads[p] / capacity[p] for p in capacity}
     overloaded = [p for p in capacity if util[p] > threshold]
@@ -178,7 +120,7 @@ def choose_reroute(rates, client_path, capacity=PATH_CAPACITY_MBPS,
             new_loads[dst] += rate
             new_util = {p: new_loads[p] / capacity[p] for p in capacity}
             if new_util[dst] > threshold:
-                continue                      # would just move the problem
+                continue
             key = (max(new_util.values()), rate)
             if best is None or key < best[0]:
                 best = (key, {"client": client, "from": src, "to": dst,
@@ -193,11 +135,7 @@ def _match_field(match, name):
         return None
 
 
-# --------------------------------------------------------------------------
-# The controller
-# --------------------------------------------------------------------------
 class AdaptivePathController(app_manager.RyuApp):
-    """Static baseline or adaptive rerouting for the diamond topology."""
 
     OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
 
@@ -217,13 +155,13 @@ class AdaptivePathController(app_manager.RyuApp):
         self.client_path = dict(CLIENT_PATH)
         self.datapaths = {}
 
-        # monitoring state
+        # monitoring 
         self.prev_flow_bytes = {}                       # client -> (bytes, t)
         self.prev_port_bytes = {}                       # path   -> (bytes, t)
         self.client_rate = {c: 0.0 for c in CLIENTS}    # Mbps offered by client
         self.tx_rate = {p: 0.0 for p in UPLINK}         # Mbps carried per path
 
-        # detection / reroute state
+        # detection and reroute 
         self.over_count = {p: 0 for p in UPLINK}
         self.under_count = {p: 0 for p in UPLINK}
         self.episodes = {}                              # path -> episode dict
@@ -236,7 +174,7 @@ class AdaptivePathController(app_manager.RyuApp):
                          self.confirm_samples, self.cooldown, self.results_dir)
         self.monitor_thread = hub.spawn(self._monitor_loop)
 
-    # ---- logging ---------------------------------------------------------
+    # stat files 
     def _open_logs(self):
         os.makedirs(self.results_dir, exist_ok=True)
         self.event_file = open(
@@ -270,7 +208,8 @@ class AdaptivePathController(app_manager.RyuApp):
             + [self.client_path[c] for c in CLIENTS])
         self.stats_file.flush()
 
-    # ---- flow table ------------------------------------------------------
+    
+    #openflow
     def add_flow(self, datapath, priority, match, actions):
         parser = datapath.ofproto_parser
         ofp = datapath.ofproto
@@ -279,19 +218,19 @@ class AdaptivePathController(app_manager.RyuApp):
             datapath=datapath, priority=priority, match=match,
             instructions=inst))
 
+
     @set_ev_cls(ofp_event.EventOFPSwitchFeatures, CONFIG_DISPATCHER)
     def switch_features(self, ev):
         dp = ev.msg.datapath
         parser = dp.ofproto_parser
         ofp = dp.ofproto
 
-        # wipe old rules so a controller restart starts clean
+        # wipe old rules so a controller restart  
         dp.send_msg(parser.OFPFlowMod(
             datapath=dp, table_id=ofp.OFPTT_ALL, command=ofp.OFPFC_DELETE,
             out_port=ofp.OFPP_ANY, out_group=ofp.OFPG_ANY))
 
-        # No table-miss rule: unknown traffic is dropped (never flooded,
-        # so the diamond can't create a loop).
+
         rules = build_rules(dp.id, self.client_path)
         for match_kwargs, out_port in rules:
             self.add_flow(dp, PRIORITY, parser.OFPMatch(**match_kwargs),
@@ -308,7 +247,7 @@ class AdaptivePathController(app_manager.RyuApp):
         elif ev.state == DEAD_DISPATCHER:
             self.datapaths.pop(dp.id, None)
 
-    # ---- monitoring ------------------------------------------------------
+    
     def _monitor_loop(self):
         while True:
             dp = self.datapaths.get(MONITORED_DPID)
@@ -316,6 +255,7 @@ class AdaptivePathController(app_manager.RyuApp):
                 self._request_stats(dp)
             hub.sleep(self.poll_interval)
 
+    #feeds into monitor
     def _request_stats(self, dp):
         parser = dp.ofproto_parser
         ofp = dp.ofproto
@@ -327,8 +267,9 @@ class AdaptivePathController(app_manager.RyuApp):
             dp, flags=0, port_no=ofp.OFPP_ANY))
 
     @set_ev_cls(ofp_event.EventOFPPortStatsReply, MAIN_DISPATCHER)
+
+    #throghput  
     def _port_stats_reply(self, ev):
-        """Carried load on the two uplinks (what actually left s1)."""
         if ev.msg.datapath.id != MONITORED_DPID:
             return
         now = time.time()
@@ -343,11 +284,9 @@ class AdaptivePathController(app_manager.RyuApp):
             self.prev_port_bytes[path] = (stat.tx_bytes, now)
 
     @set_ev_cls(ofp_event.EventOFPFlowStatsReply, MAIN_DISPATCHER)
-    def _flow_stats_reply(self, ev):
-        """Offered load per client, from the client->server flow entries on s1.
 
-        (s1 has 12 flows, so the reply always fits in one multipart message.)
-        """
+    #traffic measurement 
+    def _flow_stats_reply(self, ev):
         if ev.msg.datapath.id != MONITORED_DPID:
             return
         now = time.time()
@@ -369,14 +308,12 @@ class AdaptivePathController(app_manager.RyuApp):
             prev = self.prev_flow_bytes.get(client)
             if prev is not None:
                 prev_bytes, prev_time = prev
-                # total < prev_bytes means the entries were re-installed and
-                # the counters restarted: keep the last rate for one sample.
                 if total >= prev_bytes and now > prev_time:
                     self.client_rate[client] = ((total - prev_bytes) * 8
                                                 / (now - prev_time) / 1e6)
             self.prev_flow_bytes[client] = (total, now)
 
-    # ---- congestion detection -------------------------------------------
+    # %utilization 
     def _evaluate(self, now):
         loads = path_loads(self.client_rate, self.client_path)
         util = {p: loads[p] / PATH_CAPACITY_MBPS[p] for p in UPLINK}
@@ -388,8 +325,8 @@ class AdaptivePathController(app_manager.RyuApp):
         if self.mode == "adaptive":
             self._maybe_reroute(now)
 
+
     def _track_episode(self, path, util, load, now):
-        """Book-keeping for 'path is overloaded' episodes (all modes)."""
         ep = self.episodes.get(path)
         if util > self.threshold:
             self.over_count[path] += 1
@@ -418,7 +355,7 @@ class AdaptivePathController(app_manager.RyuApp):
                     del self.episodes[path]
                     self.under_count[path] = 0
 
-    # ---- adaptive rerouting ---------------------------------------------
+    # chek if over 0.85 ++ if over it called in eval
     def _maybe_reroute(self, now):
         if now < self.cooldown_until:
             return
@@ -444,6 +381,7 @@ class AdaptivePathController(app_manager.RyuApp):
         src_ep = self.episodes.get(move["from"])
         if src_ep is not None:
             src_ep["rerouted"] = installed
+        #generate reroute 
         self._log_event(
             "reroute", client="h%d" % move["client"],
             from_path=move["from"], to_path=move["to"],
@@ -452,12 +390,8 @@ class AdaptivePathController(app_manager.RyuApp):
                             for p, u in move["projected_util"].items()},
             install_time_s=round(installed - decided, 4))
 
+    #exacute reroute
     def _reroute(self, client, new_path):
-        """Move one client to new_path: re-push only the rules that change.
-
-        s4 (return direction) first, then s1 (forward direction). The middle
-        switches are path-agnostic, so they never need touching.
-        """
         old_map = dict(self.client_path)
         new_map = dict(old_map)
         new_map[client] = new_path
